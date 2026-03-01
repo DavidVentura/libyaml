@@ -538,6 +538,11 @@ yaml_queue_extend(void **start, void **head, void **tail, void **end);
      (token).data.tag_directive.handle = (token_handle),                        \
      (token).data.tag_directive.prefix = (token_prefix))
 
+#define COMMENT_TOKEN_INIT(token,token_value,token_length,start_mark,end_mark) \
+    (TOKEN_INIT((token),YAML_COMMENT_TOKEN,(start_mark),(end_mark)),            \
+     (token).data.comment.value = (token_value),                                \
+     (token).data.comment.length = (token_length))
+
 /*
  * Event initializers.
  */
@@ -603,6 +608,11 @@ yaml_queue_extend(void **start, void **head, void **tail, void **end);
 
 #define MAPPING_END_EVENT_INIT(event,start_mark,end_mark)                       \
     (EVENT_INIT((event),YAML_MAPPING_END_EVENT,(start_mark),(end_mark)))
+
+#define COMMENT_EVENT_INIT(event,event_value,event_length,start_mark,end_mark) \
+    (EVENT_INIT((event),YAML_COMMENT_EVENT,(start_mark),(end_mark)),            \
+     (event).data.comment.value = (event_value),                                \
+     (event).data.comment.length = (event_length))
 
 /*
  * Document initializer.

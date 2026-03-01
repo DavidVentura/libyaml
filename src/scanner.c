@@ -682,6 +682,9 @@ static int
 yaml_parser_scan_to_next_token(yaml_parser_t *parser);
 
 static int
+yaml_parser_scan_comment(yaml_parser_t *parser, yaml_token_t *token);
+
+static int
 yaml_parser_scan_directive(yaml_parser_t *parser, yaml_token_t *token);
 
 static int
@@ -1913,6 +1916,47 @@ yaml_parser_fetch_plain_scalar(yaml_parser_t *parser)
 }
 
 /*
+ * Scan a comment and produce a COMMENT token.
+ * Called when parser->buffer points at '#'.
+ * Reads everything from '#' to end of line into a token.
+ */
+
+static int
+yaml_parser_scan_comment(yaml_parser_t *parser, yaml_token_t *token)
+{
+    yaml_mark_t start_mark, end_mark;
+    yaml_string_t string = NULL_STRING;
+
+    if (!STRING_INIT(parser, string, INITIAL_STRING_SIZE)) return 0;
+
+    start_mark = parser->mark;
+
+    /* Skip the '#' character. */
+    SKIP(parser);
+    if (!CACHE(parser, 1)) goto error;
+
+    /* Read the comment text until a line break or end of stream.
+     * We preserve the raw text after '#' including spacing. */
+    while (!IS_BREAKZ(parser->buffer)) {
+        if (!READ(parser, string)) goto error;
+        if (!CACHE(parser, 1)) goto error;
+    }
+
+    end_mark = parser->mark;
+
+    /* Create the COMMENT token. */
+    COMMENT_TOKEN_INIT(*token, string.start,
+            (size_t)(string.pointer - string.start),
+            start_mark, end_mark);
+
+    return 1;
+
+error:
+    STRING_DEL(parser, string);
+    return 0;
+}
+
+/*
  * Eat whitespaces and comments until the next token is found.
  */
 
@@ -1952,9 +1996,19 @@ yaml_parser_scan_to_next_token(yaml_parser_t *parser)
         /* Eat a comment until a line break. */
 
         if (CHECK(parser->buffer, '#')) {
-            while (!IS_BREAKZ(parser->buffer)) {
-                SKIP(parser);
-                if (!CACHE(parser, 1)) return 0;
+            if (parser->preserve_comments) {
+                yaml_token_t token;
+                if (!yaml_parser_scan_comment(parser, &token))
+                    return 0;
+                if (!ENQUEUE(parser, parser->tokens, token)) {
+                    yaml_token_delete(&token);
+                    return 0;
+                }
+            } else {
+                while (!IS_BREAKZ(parser->buffer)) {
+                    SKIP(parser);
+                    if (!CACHE(parser, 1)) return 0;
+                }
             }
         }
 
@@ -2066,9 +2120,19 @@ yaml_parser_scan_directive(yaml_parser_t *parser, yaml_token_t *token)
     }
 
     if (CHECK(parser->buffer, '#')) {
-        while (!IS_BREAKZ(parser->buffer)) {
-            SKIP(parser);
-            if (!CACHE(parser, 1)) goto error;
+        if (parser->preserve_comments) {
+            yaml_token_t comment_token;
+            if (!yaml_parser_scan_comment(parser, &comment_token))
+                goto error;
+            if (!ENQUEUE(parser, parser->tokens, comment_token)) {
+                yaml_token_delete(&comment_token);
+                goto error;
+            }
+        } else {
+            while (!IS_BREAKZ(parser->buffer)) {
+                SKIP(parser);
+                if (!CACHE(parser, 1)) goto error;
+            }
         }
     }
 
@@ -2831,9 +2895,19 @@ yaml_parser_scan_block_scalar(yaml_parser_t *parser, yaml_token_t *token,
     }
 
     if (CHECK(parser->buffer, '#')) {
-        while (!IS_BREAKZ(parser->buffer)) {
-            SKIP(parser);
-            if (!CACHE(parser, 1)) goto error;
+        if (parser->preserve_comments) {
+            yaml_token_t comment_token;
+            if (!yaml_parser_scan_comment(parser, &comment_token))
+                goto error;
+            if (!ENQUEUE(parser, parser->tokens, comment_token)) {
+                yaml_token_delete(&comment_token);
+                goto error;
+            }
+        } else {
+            while (!IS_BREAKZ(parser->buffer)) {
+                SKIP(parser);
+                if (!CACHE(parser, 1)) goto error;
+            }
         }
     }
 

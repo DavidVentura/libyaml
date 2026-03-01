@@ -195,6 +195,8 @@ yaml_parser_initialize(yaml_parser_t *parser)
         goto error;
     if (!STACK_INIT(parser, parser->tag_directives, yaml_tag_directive_t*))
         goto error;
+    if (!QUEUE_INIT(parser, parser->comment_events, INITIAL_QUEUE_SIZE, yaml_event_t*))
+        goto error;
 
     return 1;
 
@@ -208,6 +210,7 @@ error:
     STACK_DEL(parser, parser->states);
     STACK_DEL(parser, parser->marks);
     STACK_DEL(parser, parser->tag_directives);
+    QUEUE_DEL(parser, parser->comment_events);
 
     return 0;
 }
@@ -237,6 +240,10 @@ yaml_parser_delete(yaml_parser_t *parser)
         yaml_free(tag_directive.prefix);
     }
     STACK_DEL(parser, parser->tag_directives);
+    while (!QUEUE_EMPTY(parser, parser->comment_events)) {
+        yaml_event_delete(&DEQUEUE(parser, parser->comment_events));
+    }
+    QUEUE_DEL(parser, parser->comment_events);
 
     memset(parser, 0, sizeof(yaml_parser_t));
 }
@@ -345,6 +352,18 @@ yaml_parser_set_encoding(yaml_parser_t *parser, yaml_encoding_t encoding)
     assert(!parser->encoding); /* Encoding is already set or detected. */
 
     parser->encoding = encoding;
+}
+
+/*
+ * Set comment preservation on a parser.
+ */
+
+YAML_DECLARE(void)
+yaml_parser_set_preserve_comments(yaml_parser_t *parser, int enable)
+{
+    assert(parser); /* Non-NULL parser object expected. */
+
+    parser->preserve_comments = (enable != 0);
 }
 
 /*
@@ -577,6 +596,18 @@ yaml_emitter_set_break(yaml_emitter_t *emitter, yaml_break_t line_break)
 }
 
 /*
+ * Set comment preservation on an emitter.
+ */
+
+YAML_DECLARE(void)
+yaml_emitter_set_preserve_comments(yaml_emitter_t *emitter, int enable)
+{
+    assert(emitter);    /* Non-NULL emitter object expected. */
+
+    emitter->preserve_comments = (enable != 0);
+}
+
+/*
  * Destroy a token object.
  */
 
@@ -607,6 +638,10 @@ yaml_token_delete(yaml_token_t *token)
 
         case YAML_SCALAR_TOKEN:
             yaml_free(token->data.scalar.value);
+            break;
+
+        case YAML_COMMENT_TOKEN:
+            yaml_free(token->data.comment.value);
             break;
 
         default:
@@ -978,6 +1013,35 @@ yaml_mapping_end_event_initialize(yaml_event_t *event)
 }
 
 /*
+ * Create a COMMENT event.
+ */
+
+YAML_DECLARE(int)
+yaml_comment_event_initialize(yaml_event_t *event,
+        const yaml_char_t *value, int length)
+{
+    yaml_mark_t mark = { 0, 0, 0 };
+    yaml_char_t *value_copy = NULL;
+
+    assert(event);      /* Non-NULL event object is expected. */
+
+    if (value) {
+        if (length < 0) {
+            length = strlen((const char *)value);
+        }
+        value_copy = yaml_malloc(length + 1);
+        if (!value_copy) return 0;
+        memcpy(value_copy, value, length);
+        value_copy[length] = '\0';
+    }
+
+    COMMENT_EVENT_INIT(*event, value_copy, (size_t)(length >= 0 ? length : 0),
+            mark, mark);
+
+    return 1;
+}
+
+/*
  * Destroy an event object.
  */
 
@@ -1019,6 +1083,10 @@ yaml_event_delete(yaml_event_t *event)
         case YAML_MAPPING_START_EVENT:
             yaml_free(event->data.mapping_start.anchor);
             yaml_free(event->data.mapping_start.tag);
+            break;
+
+        case YAML_COMMENT_EVENT:
+            yaml_free(event->data.comment.value);
             break;
 
         default:
@@ -1129,6 +1197,9 @@ yaml_document_delete(yaml_document_t *document)
     while (!STACK_EMPTY(&context, document->nodes)) {
         yaml_node_t node = POP(&context, document->nodes);
         yaml_free(node.tag);
+        yaml_free(node.head_comment);
+        yaml_free(node.inline_comment);
+        yaml_free(node.foot_comment);
         switch (node.type) {
             case YAML_SCALAR_NODE:
                 yaml_free(node.data.scalar.value);
@@ -1146,6 +1217,8 @@ yaml_document_delete(yaml_document_t *document)
     STACK_DEL(&context, document->nodes);
 
     yaml_free(document->version_directive);
+    yaml_free(document->start_comment);
+    yaml_free(document->end_comment);
     for (tag_directive = document->tag_directives.start;
             tag_directive != document->tag_directives.end;
             tag_directive++) {

@@ -262,7 +262,10 @@ typedef enum yaml_token_type_e {
     /** A TAG token. */
     YAML_TAG_TOKEN,
     /** A SCALAR token. */
-    YAML_SCALAR_TOKEN
+    YAML_SCALAR_TOKEN,
+
+    /** A COMMENT token (only produced when preserve_comments is enabled). */
+    YAML_COMMENT_TOKEN
 } yaml_token_type_t;
 
 /** The token structure. */
@@ -326,6 +329,14 @@ typedef struct yaml_token_s {
             yaml_char_t *prefix;
         } tag_directive;
 
+        /** The comment (for @c YAML_COMMENT_TOKEN). */
+        struct {
+            /** The comment text (raw text after '#', preserving spacing). */
+            yaml_char_t *value;
+            /** The length of the comment text. */
+            size_t length;
+        } comment;
+
     } data;
 
     /** The beginning of the token. */
@@ -379,7 +390,10 @@ typedef enum yaml_event_type_e {
     /** A MAPPING-START event. */
     YAML_MAPPING_START_EVENT,
     /** A MAPPING-END event. */
-    YAML_MAPPING_END_EVENT
+    YAML_MAPPING_END_EVENT,
+
+    /** A COMMENT event (only produced when preserve_comments is enabled). */
+    YAML_COMMENT_EVENT
 } yaml_event_type_t;
 
 /** The event structure. */
@@ -467,6 +481,14 @@ typedef struct yaml_event_s {
             /** The mapping style. */
             yaml_mapping_style_t style;
         } mapping_start;
+
+        /** The comment parameters (for @c YAML_COMMENT_EVENT). */
+        struct {
+            /** The comment text (raw text after '#', preserving spacing). */
+            yaml_char_t *value;
+            /** The length of the comment text. */
+            size_t length;
+        } comment;
 
     } data;
 
@@ -648,6 +670,20 @@ YAML_DECLARE(int)
 yaml_mapping_end_event_initialize(yaml_event_t *event);
 
 /**
+ * Create a COMMENT event.
+ *
+ * @param[out]      event       An empty event object.
+ * @param[in]       value       The comment text (raw text after '#').
+ * @param[in]       length      The length of the comment, or @c -1 for strlen.
+ *
+ * @returns @c 1 if the function succeeded, @c 0 on error.
+ */
+
+YAML_DECLARE(int)
+yaml_comment_event_initialize(yaml_event_t *event,
+        const yaml_char_t *value, int length);
+
+/**
  * Free any memory allocated for an event object.
  *
  * @param[in,out]   event   An event object.
@@ -774,6 +810,13 @@ struct yaml_node_s {
     /** The end of the node. */
     yaml_mark_t end_mark;
 
+    /** Full-line comment(s) before this node, \n-separated. May be @c NULL. */
+    yaml_char_t *head_comment;
+    /** End-of-line comment on the same line as this node. May be @c NULL. */
+    yaml_char_t *inline_comment;
+    /** Comment(s) after this node's block. May be @c NULL. */
+    yaml_char_t *foot_comment;
+
 };
 
 /** The document structure. */
@@ -809,6 +852,11 @@ typedef struct yaml_document_s {
     yaml_mark_t start_mark;
     /** The end of the document. */
     yaml_mark_t end_mark;
+
+    /** Comment(s) before the root node. May be @c NULL. */
+    yaml_char_t *start_comment;
+    /** Comment(s) after the root node. May be @c NULL. */
+    yaml_char_t *end_comment;
 
 } yaml_document_t;
 
@@ -1111,6 +1159,30 @@ typedef struct yaml_parser_s {
      */
 
     /**
+     * @name Comment preservation
+     * @{
+     */
+
+    /** If set to 1, the scanner preserves comments as YAML_COMMENT_TOKEN. */
+    int preserve_comments;
+
+    /** Pending comment events to be returned before the next real event. */
+    struct {
+        /** The beginning of the queue. */
+        yaml_event_t *start;
+        /** The end of the queue. */
+        yaml_event_t *end;
+        /** The head of the queue. */
+        yaml_event_t *head;
+        /** The tail of the queue. */
+        yaml_event_t *tail;
+    } comment_events;
+
+    /**
+     * @}
+     */
+
+    /**
      * @name Reader stuff
      * @{
      */
@@ -1384,6 +1456,20 @@ YAML_DECLARE(void)
 yaml_parser_set_encoding(yaml_parser_t *parser, yaml_encoding_t encoding);
 
 /**
+ * Enable or disable comment preservation on a parser.
+ *
+ * When enabled, the scanner produces @c YAML_COMMENT_TOKEN tokens and the
+ * parser emits @c YAML_COMMENT_EVENT events.  The loader attaches comments
+ * to nodes as @c head_comment, @c inline_comment, and @c foot_comment.
+ *
+ * @param[in,out]   parser          A parser object.
+ * @param[in]       enable          1 to enable, 0 to disable.
+ */
+
+YAML_DECLARE(void)
+yaml_parser_set_preserve_comments(yaml_parser_t *parser, int enable);
+
+/**
  * Scan the input stream and produce the next token.
  *
  * Call the function subsequently to produce a sequence of tokens corresponding
@@ -1646,6 +1732,9 @@ typedef struct yaml_emitter_s {
     int unicode;
     /** The preferred line break. */
     yaml_break_t line_break;
+
+    /** If set to 1, the emitter writes comments from events. */
+    int preserve_comments;
 
     /** The stack of states. */
     struct {
@@ -1917,6 +2006,18 @@ yaml_emitter_set_unicode(yaml_emitter_t *emitter, int unicode);
 
 YAML_DECLARE(void)
 yaml_emitter_set_break(yaml_emitter_t *emitter, yaml_break_t line_break);
+
+/**
+ * Enable or disable comment preservation on an emitter.
+ *
+ * When enabled, the emitter writes @c YAML_COMMENT_EVENT content to output.
+ *
+ * @param[in,out]   emitter         An emitter object.
+ * @param[in]       enable          1 to enable, 0 to disable.
+ */
+
+YAML_DECLARE(void)
+yaml_emitter_set_preserve_comments(yaml_emitter_t *emitter, int enable);
 
 /**
  * Emit an event.

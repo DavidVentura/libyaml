@@ -33,6 +33,13 @@ yaml_emitter_generate_anchor(yaml_emitter_t *emitter, int anchor_id);
 
 
 /*
+ * Comment emission helpers.
+ */
+
+static int
+yaml_emitter_dump_comments(yaml_emitter_t *emitter, const yaml_char_t *text);
+
+/*
  * Serialize functions.
  */
 
@@ -142,8 +149,16 @@ yaml_emitter_dump(yaml_emitter_t *emitter, yaml_document_t *document)
             document->start_implicit, mark, mark);
     if (!yaml_emitter_emit(emitter, &event)) goto error;
 
+    /* Emit document start comments. */
+    if (!yaml_emitter_dump_comments(emitter, document->start_comment))
+        goto error;
+
     yaml_emitter_anchor_node(emitter, 1);
     if (!yaml_emitter_dump_node(emitter, 1)) goto error;
+
+    /* Emit document end comments. */
+    if (!yaml_emitter_dump_comments(emitter, document->end_comment))
+        goto error;
 
     DOCUMENT_END_EVENT_INIT(event, document->end_implicit, mark, mark);
     if (!yaml_emitter_emit(emitter, &event)) goto error;
@@ -183,6 +198,9 @@ yaml_emitter_delete_document_and_anchors(yaml_emitter_t *emitter)
                 yaml_free(node.data.scalar.value);
             }
         }
+        yaml_free(node.head_comment);
+        yaml_free(node.inline_comment);
+        yaml_free(node.foot_comment);
         if (node.type == YAML_SEQUENCE_NODE) {
             STACK_DEL(emitter, node.data.sequence.items);
         }
@@ -197,6 +215,46 @@ yaml_emitter_delete_document_and_anchors(yaml_emitter_t *emitter)
     emitter->anchors = NULL;
     emitter->last_anchor_id = 0;
     emitter->document = NULL;
+}
+
+/*
+ * Emit comment text as one or more YAML_COMMENT_EVENT.
+ * The text may contain '\n' separating multiple comment lines.
+ * Returns 1 on success, 0 on failure.
+ */
+
+static int
+yaml_emitter_dump_comments(yaml_emitter_t *emitter, const yaml_char_t *text)
+{
+    yaml_event_t event;
+    yaml_mark_t mark = { 0, 0, 0 };
+    const yaml_char_t *start;
+    const yaml_char_t *p;
+
+    if (!text || !emitter->preserve_comments) return 1;
+
+    start = text;
+    p = text;
+    while (1) {
+        if (*p == '\n' || *p == '\0') {
+            size_t len = (size_t)(p - start);
+            yaml_char_t *value = yaml_malloc(len + 1);
+            if (!value) return 0;
+            memcpy(value, start, len);
+            value[len] = '\0';
+
+            COMMENT_EVENT_INIT(event, value, len, mark, mark);
+            if (!yaml_emitter_emit(emitter, &event)) {
+                return 0;
+            }
+
+            if (*p == '\0') break;
+            start = p + 1;
+        }
+        p++;
+    }
+
+    return 1;
 }
 
 /*
@@ -278,19 +336,37 @@ yaml_emitter_dump_node(yaml_emitter_t *emitter, int index)
 
     emitter->anchors[index-1].serialized = 1;
 
+    /* Emit head comments before the node. */
+    if (!yaml_emitter_dump_comments(emitter, node->head_comment))
+        return 0;
+
     switch (node->type) {
         case YAML_SCALAR_NODE:
-            return yaml_emitter_dump_scalar(emitter, node, anchor);
+            if (!yaml_emitter_dump_scalar(emitter, node, anchor))
+                return 0;
+            break;
         case YAML_SEQUENCE_NODE:
-            return yaml_emitter_dump_sequence(emitter, node, anchor);
+            if (!yaml_emitter_dump_sequence(emitter, node, anchor))
+                return 0;
+            break;
         case YAML_MAPPING_NODE:
-            return yaml_emitter_dump_mapping(emitter, node, anchor);
+            if (!yaml_emitter_dump_mapping(emitter, node, anchor))
+                return 0;
+            break;
         default:
             assert(0);      /* Could not happen. */
-            break;
+            return 0;
     }
 
-    return 0;       /* Could not happen. */
+    /* Emit inline comment after the node's value. */
+    if (!yaml_emitter_dump_comments(emitter, node->inline_comment))
+        return 0;
+
+    /* Emit foot comments after the node. */
+    if (!yaml_emitter_dump_comments(emitter, node->foot_comment))
+        return 0;
+
+    return 1;
 }
 
 /*

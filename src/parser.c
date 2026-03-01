@@ -42,12 +42,50 @@
 #include "yaml_private.h"
 
 /*
- * Peek the next token in the token queue.
+ * Peek the next non-comment token in the token queue.
+ * When preserve_comments is set, comment tokens are consumed and
+ * queued as YAML_COMMENT_EVENT in parser->comment_events.
  */
 
-#define PEEK_TOKEN(parser)                                                      \
-    ((parser->token_available || yaml_parser_fetch_more_tokens(parser)) ?       \
-        parser->tokens.head : NULL)
+static yaml_token_t *
+yaml_parser_peek_token(yaml_parser_t *parser)
+{
+    yaml_token_t *token;
+
+    token = (parser->token_available || yaml_parser_fetch_more_tokens(parser)) ?
+        parser->tokens.head : NULL;
+
+    if (!token || !parser->preserve_comments)
+        return token;
+
+    /* Skip comment tokens, converting them to comment events. */
+    while (token && token->type == YAML_COMMENT_TOKEN) {
+        yaml_event_t comment_event;
+        COMMENT_EVENT_INIT(comment_event,
+                token->data.comment.value,
+                token->data.comment.length,
+                token->start_mark, token->end_mark);
+        /* Transfer ownership of value string to the event. */
+        token->data.comment.value = NULL;
+
+        if (!ENQUEUE(parser, parser->comment_events, comment_event)) {
+            yaml_free(comment_event.data.comment.value);
+            return NULL;
+        }
+
+        /* Advance past this comment token. */
+        parser->token_available = 0;
+        parser->tokens_parsed++;
+        parser->tokens.head++;
+
+        token = (parser->token_available || yaml_parser_fetch_more_tokens(parser)) ?
+            parser->tokens.head : NULL;
+    }
+
+    return token;
+}
+
+#define PEEK_TOKEN(parser) yaml_parser_peek_token(parser)
 
 /*
  * Remove the next token from the queue (must be called after PEEK_TOKEN).
@@ -188,6 +226,14 @@ yaml_parser_parse(yaml_parser_t *parser, yaml_event_t *event)
 
     memset(event, 0, sizeof(yaml_event_t));
 
+    /* Return pending comment events first. */
+
+    if (parser->preserve_comments &&
+            !QUEUE_EMPTY(parser, parser->comment_events)) {
+        *event = DEQUEUE(parser, parser->comment_events);
+        return 1;
+    }
+
     /* No events after the end of the stream or error. */
 
     if (parser->stream_end_produced || parser->error ||
@@ -195,7 +241,8 @@ yaml_parser_parse(yaml_parser_t *parser, yaml_event_t *event)
         return 1;
     }
 
-    /* Generate the next event. */
+    /* Generate the next event.  This may accumulate new comment events
+     * via PEEK_TOKEN, which will be returned on subsequent calls. */
 
     return yaml_parser_state_machine(parser, event);
 }

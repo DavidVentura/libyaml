@@ -47,6 +47,60 @@ struct loader_ctx {
 };
 
 /*
+ * Helper: append comment text to a node's comment field.
+ * If the field already has content, separates with '\n'.
+ * Takes ownership of 'text' on success.
+ */
+static int
+yaml_loader_append_comment(yaml_parser_t *parser,
+        yaml_char_t **field, const yaml_char_t *text, size_t length)
+{
+    (void)parser;
+    if (!text || length == 0) return 1;
+
+    if (*field) {
+        /* Append with newline separator. */
+        size_t old_len = strlen((const char *)*field);
+        yaml_char_t *combined = yaml_malloc(old_len + 1 + length + 1);
+        if (!combined) return 0;
+        memcpy(combined, *field, old_len);
+        combined[old_len] = '\n';
+        memcpy(combined + old_len + 1, text, length);
+        combined[old_len + 1 + length] = '\0';
+        yaml_free(*field);
+        *field = combined;
+    } else {
+        yaml_char_t *copy = yaml_malloc(length + 1);
+        if (!copy) return 0;
+        memcpy(copy, text, length);
+        copy[length] = '\0';
+        *field = copy;
+    }
+    return 1;
+}
+
+/*
+ * Helper: flush pending comments to a comment field.
+ * Moves string content; resets pending buffer.
+ */
+static int
+yaml_loader_flush_comments(yaml_parser_t *parser,
+        yaml_char_t **field, yaml_string_t *pending)
+{
+    size_t len;
+    if (!pending->start || pending->pointer == pending->start)
+        return 1;
+
+    len = (size_t)(pending->pointer - pending->start);
+    if (!yaml_loader_append_comment(parser, field, pending->start, len))
+        return 0;
+
+    /* Reset the buffer for reuse. */
+    pending->pointer = pending->start;
+    return 1;
+}
+
+/*
  * Composer functions.
  */
 static int
@@ -105,15 +159,31 @@ yaml_parser_load(yaml_parser_t *parser, yaml_document_t *document)
         return 1;
     }
 
-    if (!yaml_parser_parse(parser, &event)) goto error;
+    /* Skip comment events before the document, collecting them
+     * as the document's start_comment. */
+    parser->document = document;
+    do {
+        if (!yaml_parser_parse(parser, &event)) goto error;
+        if (event.type == YAML_COMMENT_EVENT) {
+            if (parser->preserve_comments) {
+                yaml_loader_append_comment(parser,
+                        &document->start_comment,
+                        event.data.comment.value,
+                        event.data.comment.length);
+            }
+            yaml_event_delete(&event);
+            continue;
+        }
+        break;
+    } while (1);
+
     if (event.type == YAML_STREAM_END_EVENT) {
+        parser->document = NULL;
         return 1;
     }
 
     if (!STACK_INIT(parser, parser->aliases, yaml_alias_data_t*))
         goto error;
-
-    parser->document = document;
 
     if (!yaml_parser_load_document(parser, &event)) goto error;
 
@@ -217,43 +287,166 @@ static int
 yaml_parser_load_nodes(yaml_parser_t *parser, struct loader_ctx *ctx)
 {
     yaml_event_t event;
+    yaml_string_t pending_comments = NULL_STRING;
+    int last_node_index = 0;
+    size_t last_node_end_line = 0;
+    int got_first_node = 0;
+
+    if (parser->preserve_comments) {
+        if (!STRING_INIT(parser, pending_comments, INITIAL_STRING_SIZE))
+            return 0;
+    }
 
     do {
-        if (!yaml_parser_parse(parser, &event)) return 0;
+        if (!yaml_parser_parse(parser, &event)) goto load_error;
+
+        /* Handle comment events: attach to appropriate node. */
+        if (event.type == YAML_COMMENT_EVENT) {
+            if (parser->preserve_comments) {
+                int is_inline = (last_node_index > 0 &&
+                        event.start_mark.line == last_node_end_line);
+
+                if (is_inline) {
+                    /* Inline comment: attach to the last node. */
+                    yaml_node_t *last_node =
+                        &parser->document->nodes.start[last_node_index - 1];
+                    if (!yaml_loader_append_comment(parser,
+                            &last_node->inline_comment,
+                            event.data.comment.value,
+                            event.data.comment.length))
+                        goto load_error;
+                } else {
+                    /* Head comment: accumulate for the next node. */
+                    if (pending_comments.pointer != pending_comments.start) {
+                        /* Add newline separator. */
+                        if (!STRING_EXTEND(parser, pending_comments))
+                            goto load_error;
+                        *(pending_comments.pointer++) = '\n';
+                    }
+                    /* Append the comment text. */
+                    {
+                        const yaml_char_t *p = event.data.comment.value;
+                        size_t len = event.data.comment.length;
+                        size_t i;
+                        for (i = 0; i < len; i++) {
+                            if (!STRING_EXTEND(parser, pending_comments))
+                                goto load_error;
+                            *(pending_comments.pointer++) = p[i];
+                        }
+                    }
+                }
+            }
+            yaml_event_delete(&event);
+            continue;
+        }
+
+        /* Before processing a node event, flush pending comments. */
+        if (parser->preserve_comments &&
+                pending_comments.pointer != pending_comments.start) {
+            switch (event.type) {
+                case YAML_ALIAS_EVENT:
+                case YAML_SCALAR_EVENT:
+                case YAML_SEQUENCE_START_EVENT:
+                case YAML_MAPPING_START_EVENT:
+                    /* Will be flushed after node is created (below). */
+                    break;
+                case YAML_SEQUENCE_END_EVENT:
+                case YAML_MAPPING_END_EVENT: {
+                    /* Trailing comments inside a collection → foot_comment. */
+                    int container_index = *((*ctx).top - 1);
+                    yaml_node_t *container =
+                        &parser->document->nodes.start[container_index - 1];
+                    if (!yaml_loader_flush_comments(parser,
+                            &container->foot_comment, &pending_comments))
+                        goto load_error;
+                    break;
+                }
+                case YAML_DOCUMENT_END_EVENT:
+                    /* Trailing comments → document end_comment. */
+                    if (!yaml_loader_flush_comments(parser,
+                            &parser->document->end_comment, &pending_comments))
+                        goto load_error;
+                    break;
+                default:
+                    break;
+            }
+        }
 
         switch (event.type) {
             case YAML_ALIAS_EVENT:
-                if (!yaml_parser_load_alias(parser, &event, ctx)) return 0;
+                if (!yaml_parser_load_alias(parser, &event, ctx))
+                    goto load_error;
                 break;
             case YAML_SCALAR_EVENT:
-                if (!yaml_parser_load_scalar(parser, &event, ctx)) return 0;
+                if (!yaml_parser_load_scalar(parser, &event, ctx))
+                    goto load_error;
                 break;
             case YAML_SEQUENCE_START_EVENT:
-                if (!yaml_parser_load_sequence(parser, &event, ctx)) return 0;
+                if (!yaml_parser_load_sequence(parser, &event, ctx))
+                    goto load_error;
                 break;
             case YAML_SEQUENCE_END_EVENT:
                 if (!yaml_parser_load_sequence_end(parser, &event, ctx))
-                    return 0;
+                    goto load_error;
                 break;
             case YAML_MAPPING_START_EVENT:
-                if (!yaml_parser_load_mapping(parser, &event, ctx)) return 0;
+                if (!yaml_parser_load_mapping(parser, &event, ctx))
+                    goto load_error;
                 break;
             case YAML_MAPPING_END_EVENT:
                 if (!yaml_parser_load_mapping_end(parser, &event, ctx))
-                    return 0;
+                    goto load_error;
                 break;
             default:
-                assert(0);  /* Could not happen. */
-                return 0;
-            case YAML_DOCUMENT_END_EVENT:
+                assert(event.type == YAML_DOCUMENT_END_EVENT);
                 break;
         }
+
+        /* After creating a node, flush pending head comments to it
+         * and update tracking state. */
+        if (parser->preserve_comments) {
+            int current_node_count =
+                (int)(parser->document->nodes.top -
+                      parser->document->nodes.start);
+
+            if (current_node_count > 0 &&
+                    (event.type == YAML_SCALAR_EVENT ||
+                     event.type == YAML_SEQUENCE_START_EVENT ||
+                     event.type == YAML_MAPPING_START_EVENT ||
+                     event.type == YAML_ALIAS_EVENT)) {
+                int new_index = current_node_count;
+                yaml_node_t *new_node =
+                    &parser->document->nodes.start[new_index - 1];
+
+                /* Flush pending head comments. */
+                if (pending_comments.pointer != pending_comments.start) {
+                    if (!yaml_loader_flush_comments(parser,
+                            &new_node->head_comment, &pending_comments))
+                        goto load_error;
+                }
+
+                last_node_index = new_index;
+                last_node_end_line = event.end_mark.line;
+                got_first_node = 1;
+            }
+        }
+
     } while (event.type != YAML_DOCUMENT_END_EVENT);
 
     parser->document->end_implicit = event.data.document_end.implicit;
     parser->document->end_mark = event.end_mark;
 
+    if (parser->preserve_comments) {
+        STRING_DEL(parser, pending_comments);
+    }
+
     return 1;
+
+load_error:
+    if (parser->preserve_comments) {
+        STRING_DEL(parser, pending_comments);
+    }
+    return 0;
 }
 
 /*

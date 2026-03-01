@@ -280,6 +280,14 @@ yaml_emitter_set_emitter_error(yaml_emitter_t *emitter, const char *problem)
 YAML_DECLARE(int)
 yaml_emitter_emit(yaml_emitter_t *emitter, yaml_event_t *event)
 {
+    /* Handle comment events immediately without going through
+     * the event queue or accumulation logic. */
+    if (event->type == YAML_COMMENT_EVENT) {
+        int rc = yaml_emitter_state_machine(emitter, event);
+        yaml_event_delete(event);
+        return rc;
+    }
+
     if (!ENQUEUE(emitter, emitter->events, *event)) {
         yaml_event_delete(event);
         return 0;
@@ -421,8 +429,50 @@ yaml_emitter_increase_indent(yaml_emitter_t *emitter,
  */
 
 static int
+yaml_emitter_write_comment(yaml_emitter_t *emitter, yaml_event_t *event)
+{
+    yaml_string_t string;
+    size_t len = event->data.comment.length;
+
+    /* Write indent if not at start of line. */
+    if (!emitter->indention) {
+        /* We're mid-line — write as inline comment with spacing. */
+        if (!PUT(emitter, ' ')) return 0;
+    } else {
+        /* Write indentation. */
+        if (!yaml_emitter_write_indent(emitter)) return 0;
+    }
+
+    /* Write '#' */
+    if (!PUT(emitter, '#')) return 0;
+
+    /* Write the comment value (raw text after '#', preserving spacing). */
+    if (event->data.comment.value && len > 0) {
+        STRING_ASSIGN(string, event->data.comment.value, len);
+        while (string.pointer < string.end) {
+            if (!WRITE(emitter, string)) return 0;
+        }
+    }
+
+    if (!PUT_BREAK(emitter)) return 0;
+
+    emitter->indention = 1;
+    emitter->whitespace = 1;
+
+    return 1;
+}
+
+static int
 yaml_emitter_state_machine(yaml_emitter_t *emitter, yaml_event_t *event)
 {
+    /* Handle comment events transparently (don't change state). */
+    if (event->type == YAML_COMMENT_EVENT) {
+        if (emitter->preserve_comments) {
+            return yaml_emitter_write_comment(emitter, event);
+        }
+        return 1;  /* Silently discard if preserve_comments is off. */
+    }
+
     switch (emitter->state)
     {
         case YAML_EMIT_STREAM_START_STATE:
